@@ -1,0 +1,34 @@
+SELECT
+    -- Cohort size
+    COUNT(DISTINCT e.EncounterKey)                          AS total_encounters,
+    COUNT(DISTINCT v.VentilationEpisodeId)                  AS total_vent_episodes,
+
+    -- Exposure time
+    SUM(DATEDIFF('hour', v.IntubationStart, v.ExtubationEnd)) AS total_vent_hours,
+    SUM(DATEDIFF('day', v.IntubationStart, v.ExtubationEnd)) AS total_vent_days,
+
+    -- Events
+    COUNT(DISTINCT CASE WHEN u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_events,
+    COUNT(DISTINCT CASE WHEN u.UE_Flag = 0 THEN v.VentilationEpisodeId END) AS non_ue_episodes,
+
+    -- Rates
+    (COUNT(DISTINCT CASE WHEN u.UE_Flag = 1 THEN v.VentilationEpisodeId END) * 100.0
+        / NULLIF(SUM(DATEDIFF('day', v.IntubationStart, v.ExtubationEnd)),0)) AS ue_rate_per_100_days,
+
+    -- Equity slices
+    COUNT(DISTINCT CASE WHEN d.AgeGroup = 'Neonate' AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_neonates,
+    COUNT(DISTINCT CASE WHEN d.AgeGroup = 'Infant'  AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_infants,
+    COUNT(DISTINCT CASE WHEN d.AgeGroup = 'Child'   AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_children,
+    COUNT(DISTINCT CASE WHEN d.AgeGroup = 'Adolescent' AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_adolescents,
+
+    COUNT(DISTINCT CASE WHEN d.Race = 'Black'  AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_black,
+    COUNT(DISTINCT CASE WHEN d.Race = 'White'  AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_white,
+    COUNT(DISTINCT CASE WHEN d.Race = 'Hispanic' AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_hispanic
+
+FROM Encounter e
+JOIN VentilationEpisode v ON e.EncounterKey = v.EncounterKey
+LEFT JOIN UE_Fact u ON v.VentilationEpisodeId = u.VentilationEpisodeId
+LEFT JOIN PatientDim d ON e.PatientKey = d.PatientKey
+
+WHERE v.IntubationStart >= '2020-01-01' -- lookback window
+;
