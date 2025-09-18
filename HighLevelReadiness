@@ -1,34 +1,157 @@
+-- ========= PARAMETERS =========
+WITH params AS (
+  SELECT
+    TO_TIMESTAMP('2025-01-01 00:00:00') AS start_ts,
+    TO_TIMESTAMP('2025-08-01 00:00:00') AS end_ts,
+    48::INT AS notes_lookback_hours,
+    24::INT AS meds_lookback_hours
+),
+
+-- ========= DENOMINATOR: ALL VENT EPISODES OVERLAPPING WINDOW =========
+vent_episodes AS (
+  SELECT
+      l.LdaKey,
+      l.PatientDurableKey,
+      l.EncounterKey,
+      l.PlacementInstant,
+      l.RemovalInstant,
+      -- Clip exposure to the analysis window for fair vent-day calc
+      GREATEST(l.PlacementInstant, p.start_ts) AS exp_start,
+      LEAST(COALESCE(l.RemovalInstant, p.end_ts), p.end_ts) AS exp_end
+  FROM LdaFact l
+  CROSS JOIN params p
+  WHERE
+      -- keep any episode that overlaps [start_ts, end_ts]
+      (l.PlacementInstant <= p.end_ts)
+      AND (COALESCE(l.RemovalInstant, p.end_ts) >= p.start_ts)
+),
+
+-- ========= UE EVENTS PER YOUR DEFINITION =========
+ue_events AS (
+  SELECT DISTINCT
+      l.LdaKey,
+      fvf.TakenInstant AS EventInstant
+  FROM vent_episodes l
+  JOIN FlowsheetValueFact fvf
+    ON fvf.LdaKey = l.LdaKey
+  WHERE
+      fvf.FlowsheetRowEpicId = 1918
+      AND fvf.Value ILIKE '%Unplanned%'
+      -- keep only UEs within the analysis window
+      AND fvf.TakenInstant BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
+),
+
+-- ========= EPISODE INDEX (DEFINE EVENT OR CENSOR TIME) =========
+episode_index AS (
+  SELECT
+      v.LdaKey,
+      v.PatientDurableKey,
+      v.EncounterKey,
+      v.PlacementInstant,
+      v.RemovalInstant,
+      v.exp_start,
+      v.exp_end,
+      -- exposure hours clipped to window
+      DATEDIFF('hour', v.exp_start, v.exp_end) AS vent_hours_clipped,
+      ue.EventInstant,
+      -- reference_time = event_time for positives; else censor_time = RemovalInstant (or clipped end)
+      COALESCE(ue.EventInstant, v.exp_end) AS ref_time
+  FROM vent_episodes v
+  LEFT JOIN ue_events ue
+    ON ue.LdaKey = v.LdaKey
+),
+
+-- ========= PATIENT DEMOGRAPHICS (CURRENT SNAPSHOT) =========
+patient_info AS (
+  SELECT
+      p.DurableKey,
+      p.PrimaryMrn,
+      p.AgeInYears,
+      p.Race,
+      p.Sex
+  FROM PatientDim p
+  WHERE p.IsCurrent = 1
+),
+
+-- ========= QUALIFYING NOTES WITHIN 48H PRE-EVENT/CENSOR =========
+notes_pre AS (
+  SELECT DISTINCT
+      ei.LdaKey
+  FROM episode_index ei
+  JOIN ClinicalNoteFact cn
+    ON cn.EncounterKey = ei.EncounterKey
+  CROSS JOIN params prm
+  WHERE
+      -- only include allowed note types (you can refine as needed)
+      cn.Type IN (
+        'Progress Notes','Case Management','Event Note','Procedure Note','Consults',
+        'IPOC','Education','Discharge Summary','Transfer','Admission History and Physical',
+        'ED Provider Notes'
+      )
+      AND cn.ServiceInstant >= (ei.ref_time - (prm.notes_lookback_hours || ' hour')::INTERVAL)
+      AND cn.ServiceInstant <= ei.ref_time
+),
+
+-- ========= PSYCHOTHERAPEUTIC MED ADMIN ≤24H PRE-EVENT/CENSOR =========
+psych_meds_pre AS (
+  SELECT DISTINCT
+      ei.LdaKey
+  FROM episode_index ei
+  JOIN MedicationAdministrationFact maf
+    ON maf.EncounterKey = ei.EncounterKey
+  JOIN MedicationDim md
+    ON md.MedicationKey = maf.MedicationKey
+  CROSS JOIN params prm
+  WHERE
+      md.TherapeuticClass = 'PSYCHOTHERAPEUTIC DRUGS'
+      AND maf.AdministrationInstant >= (ei.ref_time - (prm.meds_lookback_hours || ' hour')::INTERVAL)
+      AND maf.AdministrationInstant <= ei.ref_time
+),
+
+-- ========= AGE BANDS (EXAMPLE SLICES) =========
+epi_with_demo AS (
+  SELECT
+      ei.*,
+      pi.AgeInYears,
+      pi.Race,
+      pi.Sex,
+      CASE
+        WHEN pi.AgeInYears IS NULL THEN 'Unknown'
+        WHEN pi.AgeInYears < 1 THEN 'Infant'
+        WHEN pi.AgeInYears BETWEEN 1 AND 12 THEN 'Child'
+        ELSE 'Adolescent'
+      END AS AgeBand
+  FROM episode_index ei
+  LEFT JOIN patient_info pi
+    ON pi.DurableKey = ei.PatientDurableKey
+)
+
+-- ========= FINAL READINESS AGGREGATE =========
 SELECT
-    -- Cohort size
-    COUNT(DISTINCT e.EncounterKey)                          AS total_encounters,
-    COUNT(DISTINCT v.VentilationEpisodeId)                  AS total_vent_episodes,
+  COUNT(DISTINCT e.LdaKey)                                                      AS total_vent_episodes,
+  SUM(NULLIF(e.vent_hours_clipped,0))/24.0                                      AS total_vent_days,
 
-    -- Exposure time
-    SUM(DATEDIFF('hour', v.IntubationStart, v.ExtubationEnd)) AS total_vent_hours,
-    SUM(DATEDIFF('day', v.IntubationStart, v.ExtubationEnd)) AS total_vent_days,
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL THEN e.LdaKey END)        AS ue_events,
+  (COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL THEN e.LdaKey END) * 100.0
+      / NULLIF(SUM(NULLIF(e.vent_hours_clipped,0))/24.0, 0))                    AS ue_rate_per_100_days,
 
-    -- Events
-    COUNT(DISTINCT CASE WHEN u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_events,
-    COUNT(DISTINCT CASE WHEN u.UE_Flag = 0 THEN v.VentilationEpisodeId END) AS non_ue_episodes,
+  -- Equity slices (examples)
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.AgeBand = 'Infant' THEN e.LdaKey END)       AS ue_infants,
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.AgeBand = 'Child' THEN e.LdaKey END)        AS ue_children,
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.AgeBand = 'Adolescent' THEN e.LdaKey END)   AS ue_adolescents,
 
-    -- Rates
-    (COUNT(DISTINCT CASE WHEN u.UE_Flag = 1 THEN v.VentilationEpisodeId END) * 100.0
-        / NULLIF(SUM(DATEDIFF('day', v.IntubationStart, v.ExtubationEnd)),0)) AS ue_rate_per_100_days,
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.Race = 'White'    THEN e.LdaKey END)        AS ue_white,
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.Race = 'Black'    THEN e.LdaKey END)        AS ue_black,
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.Race = 'Hispanic' THEN e.LdaKey END)        AS ue_hispanic,
 
-    -- Equity slices
-    COUNT(DISTINCT CASE WHEN d.AgeGroup = 'Neonate' AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_neonates,
-    COUNT(DISTINCT CASE WHEN d.AgeGroup = 'Infant'  AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_infants,
-    COUNT(DISTINCT CASE WHEN d.AgeGroup = 'Child'   AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_children,
-    COUNT(DISTINCT CASE WHEN d.AgeGroup = 'Adolescent' AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_adolescents,
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.Sex = 'M' THEN e.LdaKey END)                AS ue_males,
+  COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.Sex = 'F' THEN e.LdaKey END)                AS ue_females,
 
-    COUNT(DISTINCT CASE WHEN d.Race = 'Black'  AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_black,
-    COUNT(DISTINCT CASE WHEN d.Race = 'White'  AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_white,
-    COUNT(DISTINCT CASE WHEN d.Race = 'Hispanic' AND u.UE_Flag = 1 THEN v.VentilationEpisodeId END) AS ue_hispanic
+  -- Context availability for modeling
+  COUNT(DISTINCT CASE WHEN n.LdaKey IS NOT NULL THEN e.LdaKey END)              AS episodes_with_notes_48h,
+  COUNT(DISTINCT CASE WHEN m.LdaKey IS NOT NULL THEN e.LdaKey END)              AS episodes_with_psych_meds_24h
 
-FROM Encounter e
-JOIN VentilationEpisode v ON e.EncounterKey = v.EncounterKey
-LEFT JOIN UE_Fact u ON v.VentilationEpisodeId = u.VentilationEpisodeId
-LEFT JOIN PatientDim d ON e.PatientKey = d.PatientKey
-
-WHERE v.IntubationStart >= '2020-01-01' -- lookback window
+FROM epi_with_demo e
+LEFT JOIN notes_pre n  ON n.LdaKey = e.LdaKey
+LEFT JOIN psych_meds_pre m ON m.LdaKey = e.LdaKey
 ;
