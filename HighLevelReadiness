@@ -15,7 +15,6 @@ vent_episodes AS (
       l.InitialEncounterKey AS EncounterKey,
       l.PlacementInstant,
       l.RemovalInstant,
-      -- clip exposure to analysis window
       GREATEST(l.PlacementInstant, p.start_ts) AS exp_start,
       LEAST(COALESCE(l.RemovalInstant, p.end_ts), p.end_ts) AS exp_end
   FROM LdaFact l
@@ -24,29 +23,24 @@ vent_episodes AS (
     AND COALESCE(l.RemovalInstant, p.end_ts) >= p.start_ts
 ),
 
--- ========= MASTER FLOWSHEET ROWS (SITE COLUMNS: Name, Row_Group, RowType) =========
+-- ========= MASTER FLOWSHEET ROWS (your columns: Name, RowType) =========
 flowsheet_row_dim AS (
   SELECT DISTINCT
     frd.FlowsheetRowEpicId,
-    UPPER(frd.Name)       AS name,
-    UPPER(frd.Row_Group)  AS row_group,
-    UPPER(frd.RowType)    AS row_type
+    UPPER(frd.Name)    AS name,
+    UPPER(frd.RowType) AS row_type
   FROM FlowsheetRowDim frd
 ),
 
--- ========= WHITELIST ETT/AIRWAY DATA ROWS =========
+-- ========= WHITELIST ETT/AIRWAY DATA ROWS (name-only + type=DATA) =========
 extubation_rows AS (
   SELECT DISTINCT frd.FlowsheetRowEpicId
   FROM flowsheet_row_dim frd
   WHERE frd.row_type = 'DATA'
-    AND (
-      frd.name ILIKE '%extubat%'      -- row name mentions extubation
-      OR frd.row_group ILIKE '%airway%'
-      OR frd.row_group ILIKE '%ett%'
-    )
+    AND frd.name ILIKE '%extubat%'   -- e.g., "Extubation Tolerance", "Unplanned Extubation", etc.
 ),
 
--- ========= UE EVENTS (TEXT + ROW WHITELIST + LDA SCOPE + TIME PROXIMITY) =========
+-- ========= UE EVENTS (TEXT + ROW WHITELIST + TIME PROXIMITY) =========
 ue_events AS (
   SELECT DISTINCT
       v.LdaKey,
@@ -58,12 +52,11 @@ ue_events AS (
     ON er.FlowsheetRowEpicId = fvf.FlowsheetRowEpicId
   WHERE
       (
-        fvf.Value ILIKE '%unplan%'                               -- unplanned
-        OR (fvf.Value ILIKE '%self%' AND fvf.Value ILIKE '%extubat%') -- self-extubation
-        OR fvf.Value ILIKE '%accident%extubat%'                  -- accidental extubation
+        fvf.Value ILIKE '%unplan%'
+        OR (fvf.Value ILIKE '%self%' AND fvf.Value ILIKE '%extubat%')
+        OR fvf.Value ILIKE '%accident%extubat%'
       )
       AND fvf.TakenInstant BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
-      -- tie documentation to removal for THIS ETT to reduce false positives
       AND ABS(DATEDIFF('minute', fvf.TakenInstant, v.RemovalInstant)) <= 120
 ),
 
@@ -79,13 +72,13 @@ episode_index AS (
       v.exp_end,
       DATEDIFF('hour', v.exp_start, v.exp_end) AS vent_hours_clipped,
       ue.EventInstant,
-      COALESCE(ue.EventInstant, v.exp_end) AS ref_time  -- event for positives; censored at exp_end otherwise
+      COALESCE(ue.EventInstant, v.exp_end) AS ref_time
   FROM vent_episodes v
   LEFT JOIN ue_events ue
     ON ue.LdaKey = v.LdaKey
 ),
 
--- ========= PATIENT DEMOGRAPHICS (ROBUST RACE ROLLUP) =========
+-- ========= PATIENT DEMOGRAPHICS (RACE ROLLUP) =========
 patient_info AS (
   SELECT
       p.DurableKey,
@@ -97,7 +90,7 @@ patient_info AS (
   WHERE p.IsCurrent = 1
 ),
 
--- ========= NOTES IN 48H PRE-EVENT/CENSOR (LEAKAGE-SAFE) =========
+-- ========= NOTES IN 48H PRE-EVENT/CENSOR =========
 notes_pre AS (
   SELECT DISTINCT ei.LdaKey
   FROM episode_index ei
@@ -113,7 +106,7 @@ notes_pre AS (
                               AND ei.ref_time
 ),
 
--- ========= PSYCH MEDS IN 24H PRE-EVENT/CENSOR (LEAKAGE-SAFE) =========
+-- ========= PSYCH MEDS IN 24H PRE-EVENT/CENSOR =========
 psych_meds_pre AS (
   SELECT DISTINCT ei.LdaKey
   FROM episode_index ei
@@ -154,7 +147,6 @@ SELECT
   (COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL THEN e.LdaKey END) * 100.0
       / NULLIF(SUM(NULLIF(e.vent_hours_clipped,0))/24.0, 0))                    AS ue_rate_per_100_days,
 
-  -- equity slices
   COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.AgeBand = 'Infant' THEN e.LdaKey END)       AS ue_infants,
   COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.AgeBand = 'Child' THEN e.LdaKey END)        AS ue_children,
   COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.AgeBand = 'Adolescent' THEN e.LdaKey END)   AS ue_adolescents,
@@ -166,7 +158,6 @@ SELECT
   COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.Sex = 'M' THEN e.LdaKey END)                AS ue_males,
   COUNT(DISTINCT CASE WHEN e.EventInstant IS NOT NULL AND e.Sex = 'F' THEN e.LdaKey END)                AS ue_females,
 
-  -- context availability
   COUNT(DISTINCT CASE WHEN n.LdaKey IS NOT NULL THEN e.LdaKey END)              AS episodes_with_notes_48h,
   COUNT(DISTINCT CASE WHEN m.LdaKey IS NOT NULL THEN e.LdaKey END)              AS episodes_with_psych_meds_24h
 
